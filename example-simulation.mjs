@@ -3,8 +3,9 @@
 // It drives a synthetic population through a real staging instance of a dating
 // product and checks invariants on every response. It is included whole, rather
 // than as a sketch, because the useful parts are the awkward ones: the segments
-// that misbehave, the unicode in the name list, the tamper probes, and the
-// per-segment reporting that puts the worst-served group first.
+// that misbehave, the unicode in the name list, the tamper probes, the
+// never-seen measurement that found a hidden pool filter, and the per-segment
+// reporting that puts the worst-served group first.
 //
 // Nothing here is reusable as a library. Copy the shape, not the endpoints.
 //
@@ -90,6 +91,9 @@ const SEGMENTS = {
   spammer:     { w: 5,  swipes: 60, woo: 0.95, msg: 1.0,  edits: 0.0, floods: true },
   harasser:    { w: 4,  swipes: 40, woo: 0.8,  msg: 1.0,  edits: 0.0, abusive: true },
   quitter:     { w: 4,  swipes: 12, woo: 0.4,  msg: 0.4,  edits: 0.0, deletes: true },
+  // Leaves without deleting, which is what most people actually do. Half never
+  // finish the profile at all; the rest stop after a card or two.
+  abandoner:   { w: 10, swipes: 2,  woo: 0.15, msg: 0.05, edits: 0.0, abandons: 0.5 },
   vandal:      { w: 3,  swipes: 10, woo: 0.3,  msg: 0.3,  edits: 0.0, tampers: true },
 };
 
@@ -163,6 +167,12 @@ async function run() {
 
   // ---------------------------------------------------------- 1. profiles
   for (const person of people) {
+    // Half the abandoners never finish the form. They are counted as arrivals
+    // and never as users, which is the shape of a real signup funnel.
+    if (person.spec.abandons && chance(person.spec.abandons)) {
+      person.abandonedAtOath = true;
+      continue;
+    }
     const { status, body } = await api("/profile", {
       as: sess(person), method: "PUT", body: person,
     });
@@ -188,11 +198,31 @@ async function run() {
   const active = people.filter((p) => p.ok);
 
   // ------------------------------------------------------- 2. first decks
+  //
+  // Every id anybody was ever offered. A profile that appears in nobody's deck
+  // is invisible to the whole product, which no per-user metric can show: each
+  // individual deck looks full while a slice of the population is unreachable.
+  const everSeen = new Set();
   for (const person of active) {
     const { body } = await api("/deck", { as: sess(person) });
     person.deck = body.cards ?? [];
+    for (const card of person.deck) everSeen.add(card.id);
     checkDeck(person, person.deck, byId, "first");
   }
+  stats.neverSeen = active.filter((p) => !everSeen.has(p.id)).length;
+  stats.everSeen = everSeen.size;
+
+  // Reachability, not the page, is what has to be symmetric.
+  //
+  // A first attempt asserted that if B is in A's deck then A is in B's, and it
+  // fired 560 times against a product that was working. It could not have held:
+  // the deck is the top twenty after per-viewer ranking, so two people rank
+  // each other differently and land on different pages. The instrument was
+  // wrong, not the product.
+  //
+  // What genuinely must hold is that nobody is unreachable, which `neverSeen`
+  // above measures directly: a ring-rotated pool sent it to 748 of 1,148 while
+  // every individual deck still looked full.
 
   // --------------------------------------------------------- 3. behaviour
   for (const person of active) {
@@ -218,6 +248,35 @@ async function run() {
 
     // A vandal tries the things a curious engineer tries in devtools.
     if (person.spec.tampers) await tamper(person, byId);
+  }
+
+  // ------------------------------------- 3b. the second visit, if prompted
+  //
+  // v4 tells people how many are waiting on their answer. The behaviour that
+  // is supposed to cause is a return visit that closes the loop, so it is
+  // modelled rather than assumed: anybody told somebody is waiting comes back
+  // with a probability, and swipes a few more.
+  for (const person of active) {
+    const { body } = await api("/deck", { as: sess(person) });
+    const waiting = body.waitingOnYou ?? 0;
+    person.waitingOnYou = waiting;
+    if (waiting === 0) continue;
+    // Lurkers and abandoners still mostly do not come back.
+    const returns = person.spec.swipes <= 3 ? 0.15 : 0.55;
+    if (!chance(returns)) continue;
+    person.returned = true;
+
+    for (const card of (body.cards ?? []).slice(0, 8)) {
+      const eager = person.spec.woo * (0.6 + card.harmony / 100);
+      const verdict = chance(eager) ? "woo" : "pass";
+      const { status, body: judged } = await api("/judge", {
+        as: sess(person), method: "POST", body: { subjectId: card.id, verdict },
+      });
+      if (status === 429) { stats.rateLimited += 1; break; }
+      if (status !== 200) continue;
+      if (verdict === "woo") person.woos += 1;
+      if (judged.matched) person.matches.push({ id: judged.matchId, with: card.id });
+    }
   }
 
   // ------------------------------------------------- 4. talking, and abuse
@@ -274,7 +333,14 @@ async function run() {
   for (const person of survivors) {
     const { status, body } = await api("/deck", { as: sess(person) });
     if (status !== 200) {
-      violation("deck-failed-after", { who: person.id, status, error: body.error });
+      // 401 is correct for somebody the product suspended during the run, which
+      // is now a thing that happens: three distinct reporters and the account is
+      // signed out. Anything else is a real failure.
+      if (status !== 401) {
+        violation("deck-failed-after", { who: person.id, status, error: body.error });
+      } else {
+        stats.suspended = (stats.suspended ?? 0) + 1;
+      }
       continue;
     }
     checkDeck(person, body.cards ?? [], byId, "after", { deleted: true });
@@ -412,6 +478,7 @@ function report(people, active, survivors, stats) {
   console.log(JSON.stringify({
     cohort: people.length,
     requests,
+    abandonedAtOath: people.filter((p) => p.abandonedAtOath).length,
     accepted: active.length,
     stats,
     defects: {
@@ -428,6 +495,8 @@ function report(people, active, survivors, stats) {
       matched: active.filter((p) => (p.matches?.length ?? 0) > 0).length,
       talked: active.filter((p) => (p.sent ?? 0) > 0).length,
       medianDeck: median(active.map((p) => p.deck?.length ?? 0)),
+      toldSomebodyWaiting: active.filter((p) => (p.waitingOnYou ?? 0) > 0).length,
+      cameBack: active.filter((p) => p.returned).length,
     },
     bySegment: Object.fromEntries(Object.entries(bySegment).map(([k, s]) => [k, {
       n: s.n, medianDeck: round(s.deck / s.n), emptyShare: round(s.empty / s.n),

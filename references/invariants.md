@@ -58,6 +58,24 @@ context to reproduce. A count alone is not actionable.
 - A refusal is never a 500. A 500 on bad input is a defect even when the input
   was absurd.
 
+## Phrase it at the right layer
+
+An invariant asserted at the wrong layer produces confident nonsense. A first
+attempt at the symmetry check above asserted that if B is in A's result page
+then A is in B's. It fired 560 times against a product that was working
+correctly, because the page is the top twenty after per-viewer ranking, and two
+people rank each other differently.
+
+The property that mattered was reachability, one layer down: nobody should be
+unreachable by everybody. That is measured by collecting every id offered to
+anyone across the whole run and subtracting, not by comparing two pages.
+
+Before adding an invariant, ask which layer owns the property: the row, the
+query, the page, or the run. Symmetry belongs to the query. Uniqueness belongs
+to the page. "Nobody is invisible" belongs to the run.
+
+Expect this: when a check fires in the hundreds, suspect the check first.
+
 ## Writing a new one
 
 Ask: what would make a user say "that should not have happened"? Phrase that as

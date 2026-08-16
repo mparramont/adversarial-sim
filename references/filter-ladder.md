@@ -10,7 +10,8 @@ Observed on a dating product, three rounds running:
 |---|---|---|
 | v1 | Distance: cross-border needed one side willing to move | 492 of 800 possible pairs dropped. Median deck 6. |
 | v2 | Language: no shared language meant no card | Thailand, Japan and Italy all on a 0% match rate. |
-| v3 | Nothing left to remove at that layer | The pool query itself: only the 200 most recently updated rows were ever considered. |
+| v3 | Nothing left to remove at that layer | The pool query itself: only the 200 most recently updated rows were ever considered. 748 of 1,148 accounts appeared in nobody's deck. |
+| v4 | The pool cap | Nothing, once the cap stopped binding. The ladder ends when removing a filter changes no minority outcome. |
 
 The pattern is not specific to dating. Any pipeline of the shape
 `fetch -> filter -> filter -> rank -> paginate` has it.
@@ -38,6 +39,20 @@ to be fixed.
   server test will find.
 - **Implicit ordering.** If a tie is broken by id, the same accounts win every
   time. That is a filter that runs once per request forever.
+
+## The fix can be worse than the defect
+
+Replacing the recency cap with a per-viewer ring rotation fixed visibility
+perfectly and took matching from 129 to 0.
+
+A rotation gives each viewer the N ids following their own. It is uniform,
+deterministic, and completely asymmetric: A can see B while B cannot see A. Any
+outcome needing two parties cannot survive that, and no correctness invariant
+catches it, because nothing invalid happened.
+
+**Rule: if the product has a mutual outcome, recall must be symmetric.** Check
+it explicitly, and check the outcome metric after every recall change, not just
+the exposure metric.
 
 ## The test
 
